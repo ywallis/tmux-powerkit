@@ -3357,6 +3357,39 @@ _setup_aiq_shim_claudecode() {
     assert_success
 }
 
+@test "claudecode metrics: unscoped row wins over a scoped sibling of the same kind, regardless of order" {
+    # A scoped session row listed first must not shadow the account-wide one.
+    run _aiquotas_metrics_document "claudecode" \
+        '{"limits":[
+           {"kind":"session","percent":50,"resets_at":null,"scope":{"surface":"web"}},
+           {"kind":"session","percent":12,"resets_at":null,"scope":null},
+           {"kind":"weekly_all","percent":38,"resets_at":null,"scope":null}]}'
+    assert_success
+    run jq -e '
+        (.records[0].value == 12) and
+        (.records[0].dimensions.line_item == "5h") and
+        (.records[0].dimensions.weekly_remaining_percent == 62)
+    ' <<<"$output"
+    assert_success
+}
+
+@test "claudecode metrics: a row with null percent falls through to the top-level object" {
+    # Present-but-empty row: the five_hour object still carries the number.
+    run _aiquotas_metrics_document "claudecode" \
+        '{"limits":[
+           {"kind":"session","percent":null,"resets_at":null,"scope":null},
+           {"kind":"weekly_all","percent":38,"resets_at":null,"scope":null}],
+          "five_hour":{"utilization":8.0,"resets_at":"2026-09-17T14:00:00.1+00:00"}}'
+    assert_success
+    run jq -e '
+        (.records[0].value == 8) and
+        (.records[0].dimensions.line_item == "5h") and
+        (.records[0].dimensions.weekly_remaining_percent == 62) and
+        (.records[0].window_end == "2026-09-17T14:00:00Z")
+    ' <<<"$output"
+    assert_success
+}
+
 @test "claudecode metrics: falls back to five_hour/seven_day when limits[] absent" {
     run _aiquotas_metrics_document "claudecode" \
         '{"five_hour":{"utilization":8.0,"resets_at":"2026-09-17T14:00:00.1+00:00"},
@@ -3462,6 +3495,32 @@ _setup_aiq_shim_claudecode() {
         (.provider_outcomes[0].status == "unconfigured")
     ' <<<"$output"
     assert_success
+}
+
+@test "claudecode adapter: credentials path with a literal ~/ prefix is expanded against HOME" {
+    run bash -c '
+        unset CLAUDE_CODE_OAUTH_TOKEN
+        export HOME
+        HOME="$(mktemp -d -t aqtcc_home.XXXXXX)"
+        mkdir -p "$HOME/.claude"
+        printf "%s" "{\"claudeAiOauth\":{\"accessToken\":\"sk-ant-oat01-dummy-fixture-only-0000\"}}" >"$HOME/.claude/.credentials.json"
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider claudecode
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        get_option() {
+            case "$1" in
+                claudecode_credentials_file) printf "~/.claude/.credentials.json" ;;
+                *) printf "" ;;
+            esac
+        }
+        _aiquotas_claudecode_token
+        rm -rf "$HOME"
+    ' _ "$POWERKIT_ROOT"
+    assert_success
+    assert_output "sk-ant-oat01-dummy-fixture-only-0000"
 }
 
 @test "claudecode adapter: CLAUDE_CODE_OAUTH_TOKEN is preferred over the credentials file" {
