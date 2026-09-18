@@ -383,12 +383,20 @@ _aiquotas_metrics_document() {
             # scoped to that model. A second record for it is the obvious
             # follow-up.
             ((.limits // []) | if type == "array" then . else [] end) as $limits |
-            ($limits | map(select(.kind == "session"))       | .[0] // null) as $row5 |
-            ($limits | map(select(.kind == "weekly_all"))    | .[0] // null) as $rowwk |
-            (if $row5  != null then $row5.percent  else (.five_hour.utilization? // null) end) as $pct5 |
-            (if $rowwk != null then $rowwk.percent else (.seven_day.utilization? // null) end) as $pctwk |
-            (if $row5  != null then $row5.resets_at  else (.five_hour.resets_at? // null) end) as $reset5 |
-            (if $rowwk != null then $rowwk.resets_at else (.seven_day.resets_at? // null) end) as $resetwk |
+            # Prefer the account-wide (unscoped) row of each kind, then any row
+            # of that kind, so a scoped sibling listed first cannot win on
+            # array order.
+            def pick_row($kind):
+                ($limits | map(select(.kind == $kind))) as $rows |
+                (($rows | map(select((.scope // null) == null)) | .[0]) // $rows[0] // null);
+            pick_row("session")    as $row5 |
+            pick_row("weekly_all") as $rowwk |
+            # Row value first, top-level object second: a present row with a
+            # null percent still falls through to five_hour / seven_day.
+            (($row5.percent  // null) // (.five_hour.utilization? // null)) as $pct5 |
+            (($rowwk.percent // null) // (.seven_day.utilization? // null)) as $pctwk |
+            (($row5.resets_at  // null) // (.five_hour.resets_at? // null)) as $reset5 |
+            (($rowwk.resets_at // null) // (.seven_day.resets_at? // null)) as $resetwk |
             if (($pct5 | type) != "number") and (($pctwk | type) != "number")
             then error("unknown schema")
             else

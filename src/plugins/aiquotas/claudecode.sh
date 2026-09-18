@@ -29,13 +29,25 @@
 # contains no subscription window at all. The two are complementary, not
 # alternatives.
 #
+# --- Recommended setup: a long-lived token via `claude setup-token` ----------
+#
+# Run `claude setup-token` once and export the printed token as
+# CLAUDE_CODE_OAUTH_TOKEN in your shell profile (so tmux inherits it). Claude
+# Code documents this as a one-year OAuth token for non-interactive use, and it
+# is the only path that works on every platform: on macOS the interactive
+# login stores credentials in the Keychain, and ~/.claude/.credentials.json
+# only exists there as a fallback (locked Keychain, SSH sessions). On Linux and
+# Windows the credentials file is the primary store, so the fallback below
+# works out of the box, subject to caveat 1.
+#
 # --- Two operational caveats, both confirmed against the live endpoint --------
 #
-# 1. The access token is short-lived (roughly hourly) and ONLY Claude Code
-#    refreshes it. The credentials file is therefore re-read on every collect
-#    and the token is never cached here. Expect intermittent `unauthorized`
-#    when Claude Code has not run for a while; the lifecycle keeps the previous
-#    value and marks it stale, which is the right outcome.
+# 1. The interactive-login access token in the credentials file is short-lived
+#    (roughly hourly) and ONLY Claude Code refreshes it. The file is therefore
+#    re-read on every collect and the token is never cached here. Expect
+#    intermittent `unauthorized` when Claude Code has not run for a while; the
+#    lifecycle keeps the previous value and marks it stale, which is the right
+#    outcome. A setup-token in CLAUDE_CODE_OAUTH_TOKEN sidesteps this entirely.
 #
 # 2. The endpoint rate-limits aggressively: roughly eight requests in quick
 #    succession returned 429 for about five minutes. Users should keep
@@ -51,10 +63,11 @@ source_guard "aiquotas_claudecode" && return 0
 # -----------------------------------------------------------------------------
 # Token resolution
 # -----------------------------------------------------------------------------
-# CLAUDE_CODE_OAUTH_TOKEN wins when set (the variable Claude Code itself accepts
-# for headless auth, so honouring it keeps CI and container setups working).
-# Otherwise read claudeAiOauth.accessToken out of the credentials file, the same
-# way the openai adapter reads the Codex OAuth file.
+# CLAUDE_CODE_OAUTH_TOKEN wins when set. It is the variable Claude Code itself
+# accepts for headless auth and the one `claude setup-token` is meant for, so it
+# is the recommended configuration (see header). Otherwise read
+# claudeAiOauth.accessToken out of the credentials file, the same way the
+# openai adapter reads the Codex OAuth file.
 #
 # Prints the token on stdout, or nothing when none can be resolved.
 _aiquotas_claudecode_token() {
@@ -65,8 +78,14 @@ _aiquotas_claudecode_token() {
 
     local creds
     creds=$(get_option "claudecode_credentials_file")
-    # tmux option values are not shell-expanded, so a leading ~ is literal.
-    [[ "$creds" == "~"* ]] && creds="${HOME}${creds#\~}"
+    # tmux option values are not shell-expanded, so a leading ~/ is literal.
+    # Only the bare-home form is expanded; ~user/... is left untouched rather
+    # than being silently rewritten under the current $HOME.
+    if [[ "$creds" == "~" ]]; then
+        creds="$HOME"
+    elif [[ "$creds" == \~/* ]]; then
+        creds="${HOME}/${creds#\~/}"
+    fi
     [[ -n "$creds" && -r "$creds" ]] || return 0
 
     jq -r '.claudeAiOauth.accessToken // empty' "$creds" 2>/dev/null
