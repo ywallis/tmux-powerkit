@@ -31,6 +31,73 @@ source_guard "renderer_compositor" && return 0
 # Helper Functions
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# Foreign status-right interpolations
+#
+# Other tmux plugins register themselves by adding a "#(script)" interpolation
+# to status-right and rely on tmux running it on every status redraw.
+# tmux-continuum is the prominent case: its periodic autosave is nothing but
+# such a snippet. Overwriting status-right removes the snippet, and because a
+# #() only runs while it is rendered, the plugin is dead until the tmux server
+# restarts, with no visible sign. The compositor therefore carries every #()
+# it does not own across each layout it applies.
+# -----------------------------------------------------------------------------
+
+# Foreign interpolations found in status-right when compose_layout started.
+# Set once per compose_layout, consumed by the _apply_* functions.
+_FOREIGN_STATUS_RIGHT=""
+
+# Print the #(...) interpolations in a status string that do not belong to
+# PowerKit, concatenated in their original order. Nested parentheses are
+# honoured and an escaped "##(" is left alone.
+# Usage: _foreign_interpolations "status string"
+_foreign_interpolations() {
+    local value="$1" out="" snippet ch
+    local -i i=0 n=${#value} start depth
+
+    while ((i < n)); do
+        if [[ "${value:i:2}" != "#(" ]]; then
+            i=$((i + 1))
+            continue
+        fi
+        if ((i > 0)) && [[ "${value:i-1:1}" == "#" ]]; then
+            i=$((i + 1))
+            continue
+        fi
+
+        start=$i
+        depth=0
+        while ((i < n)); do
+            ch=${value:i:1}
+            if [[ "$ch" == "(" ]]; then
+                depth=$((depth + 1))
+            elif [[ "$ch" == ")" ]]; then
+                depth=$((depth - 1))
+                ((depth == 0)) && break
+            fi
+            i=$((i + 1))
+        done
+        snippet=${value:start:i-start+1}
+        i=$((i + 1))
+
+        # PowerKit's own render calls live under POWERKIT_ROOT
+        if [[ "$snippet" == *"${POWERKIT_ROOT}"* || "$snippet" == *powerkit-render* ]]; then
+            continue
+        fi
+        out+="$snippet"
+    done
+
+    printf '%s' "$out"
+}
+
+# Foreign interpolations currently in status-right, read from tmux.
+# Usage: _foreign_status_right
+_foreign_status_right() {
+    local current
+    current=$(tmux show-option -gqv status-right 2>/dev/null) || current=""
+    _foreign_interpolations "$current"
+}
+
 # Check if order explicitly includes windows AND has exactly 3 elements
 # This indicates user wants centered layout (not auto-expanded)
 # Usage: _is_explicit_three_element_order "order"
@@ -903,7 +970,7 @@ _apply_single_standard() {
 
     # Apply to tmux
     tmux set-option -g status-left "$left_content"
-    tmux set-option -g status-right "$right_content"
+    tmux set-option -g status-right "${_FOREIGN_STATUS_RIGHT}${right_content}"
     tmux set-option -g status-justify "left"
     tmux set-option -g @_powerkit_left_edge_sep "$(_build_left_edge_separator)"
     tmux set-option -g 'status-format[0]' "$(_get_default_status_format)"
@@ -977,11 +1044,11 @@ _apply_single_inverted() {
     fmt+="$left_content"
     fmt+="#[pop-default]#[norange default]"
     fmt+="#[nolist align=right range=right #{E:status-right-style}]#[push-default]"
-    fmt+="$right_content"
+    fmt+="${right_content}${_FOREIGN_STATUS_RIGHT}"
     fmt+="#[pop-default]#[norange default]"
 
     tmux set-option -g status-left ""
-    tmux set-option -g status-right ""
+    tmux set-option -g status-right "$_FOREIGN_STATUS_RIGHT"
     tmux set-option -g 'status-format[0]' "$fmt"
     _clear_extra_status_lines
     tmux set-option -g status on
@@ -1072,12 +1139,12 @@ _apply_single_centered() {
     fmt+="#[align=centre]"
     fmt+="$center_content"
     fmt+="#[nolist align=right range=right #{E:status-right-style}]#[push-default]"
-    fmt+="$right_content"
+    fmt+="${right_content}${_FOREIGN_STATUS_RIGHT}"
     fmt+="#[pop-default]#[norange default]"
 
     # Apply to tmux
     tmux set-option -g status-left ""
-    tmux set-option -g status-right ""
+    tmux set-option -g status-right "$_FOREIGN_STATUS_RIGHT"
     tmux set-option -g 'status-format[0]' "$fmt"
     _clear_extra_status_lines
     tmux set-option -g status on
@@ -1128,6 +1195,7 @@ _apply_double_layout() {
         line1_content="#[bg=${status_bg}]#[align=right]"
         line1_content+=$(_build_line_content line1_entities "right")
     fi
+    line1_content+="$_FOREIGN_STATUS_RIGHT"
 
     # Apply to tmux
     tmux set-option -g 'status-format[0]' "$line0_content"
@@ -1135,7 +1203,7 @@ _apply_double_layout() {
     tmux set-option -g 'status-format[2]' ''
     tmux set-option -g 'status-format[3]' ''
     tmux set-option -g status-left ""
-    tmux set-option -g status-right ""
+    tmux set-option -g status-right "$_FOREIGN_STATUS_RIGHT"
     tmux set-option -g status 2
 
     log_debug "compositor" "Double layout applied: order=$order"
@@ -1229,6 +1297,7 @@ compose_layout() {
     bar_layout=$(get_tmux_option "@powerkit_bar_layout" "${POWERKIT_DEFAULT_BAR_LAYOUT}")
     order=$(get_tmux_option "@powerkit_status_order" "${POWERKIT_DEFAULT_STATUS_ORDER}")
     order=$(_expand_order "$order")
+    _FOREIGN_STATUS_RIGHT=$(_foreign_status_right)
 
     log_debug "compositor" "Layout: $bar_layout, Order: $order"
 

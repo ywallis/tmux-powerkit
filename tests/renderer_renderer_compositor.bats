@@ -267,6 +267,87 @@ setup() {
     assert_failure
 }
 
+# =============================================================================
+# compositor: foreign #() interpolations survive a layout apply
+# =============================================================================
+
+# Source everything compositor.sh needs, then run the given snippet
+_foreign_run() {
+    run bash -c '
+        unset TMUX
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/renderer/separator.sh"
+        source "$1/src/renderer/color_resolver.sh"
+        source "$1/src/renderer/entities/session.sh"
+        source "$1/src/renderer/entities/windows.sh"
+        source "$1/src/renderer/entities/plugins.sh"
+        source "$1/src/renderer/compositor.sh"
+        eval "$2"
+    ' _ "$POWERKIT_ROOT" "$1"
+}
+
+@test "compositor _foreign_interpolations keeps a continuum save snippet" {
+    _foreign_run 'printf "%s" "$(_foreign_interpolations "#(/home/u/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh)#(${POWERKIT_ROOT}/bin/powerkit-render right)")"'
+    assert_success
+    assert_output "#(/home/u/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh)"
+}
+
+@test "compositor _foreign_interpolations drops PowerKit's own render call" {
+    _foreign_run 'printf "%s" "$(_foreign_interpolations "#(${POWERKIT_ROOT}/bin/powerkit-render right)")"'
+    assert_success
+    assert_output ""
+}
+
+@test "compositor _foreign_interpolations drops a powerkit-render call from another install" {
+    _foreign_run 'printf "%s" "$(_foreign_interpolations "#(/nix/store/abc-tmux-powerkit/bin/powerkit-render right)")"'
+    assert_success
+    assert_output ""
+}
+
+@test "compositor _foreign_interpolations ignores plain text and #{} formats" {
+    _foreign_run 'printf "%s" "$(_foreign_interpolations "Continuum: #{continuum_status} %H:%M #[fg=red]x")"'
+    assert_success
+    assert_output ""
+}
+
+@test "compositor _foreign_interpolations honours nested parentheses" {
+    _foreign_run 'printf "%s" "$(_foreign_interpolations "#(echo \$(date +%s)) tail")"'
+    assert_success
+    assert_output '#(echo $(date +%s))'
+}
+
+@test "compositor _foreign_interpolations leaves an escaped ##( alone" {
+    _foreign_run 'printf "%s" "$(_foreign_interpolations "##(not a command) #(real)")"'
+    assert_success
+    assert_output "#(real)"
+}
+
+@test "compositor _foreign_interpolations preserves order of several snippets" {
+    _foreign_run 'printf "%s" "$(_foreign_interpolations "#(a)#(${POWERKIT_ROOT}/bin/powerkit-render right)#(b c)")"'
+    assert_success
+    assert_output "#(a)#(b c)"
+}
+
+@test "compositor _foreign_interpolations returns empty for empty input" {
+    _foreign_run 'printf "[%s]" "$(_foreign_interpolations "")"'
+    assert_success
+    assert_output "[]"
+}
+
+@test "compositor _foreign_status_right reads status-right from tmux" {
+    mock_dir=$(create_mock_path)
+    export PATH="$mock_dir:$PATH"
+    cat >"$mock_dir/tmux" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$*" == "show-option -gqv status-right" ]] && printf '%s' '#(/p/continuum_save.sh)#(/x/bin/powerkit-render right)'
+exit 0
+MOCK
+    chmod +x "$mock_dir/tmux"
+    _foreign_run 'printf "%s" "$(_foreign_status_right)"'
+    assert_success
+    assert_output "#(/p/continuum_save.sh)"
+}
+
 @test "plugins_render returns #() call to powerkit-render" {
     run bash -c '
         unset TMUX
