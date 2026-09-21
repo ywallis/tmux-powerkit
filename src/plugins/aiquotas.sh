@@ -28,7 +28,7 @@
 #   * _metrics.sh — _aiquotas_metrics_document (canonical jq document builder)
 #   * _render.sh  — record→text render helpers (compact / detailed)
 #   * _health.sh  — _aiquotas_worst_health / _aiquotas_threshold_health
-#   * <provider>.sh — per-adapter files (anthropic, openai, deepseek, minimax, zai, kimicode, claudecode, xiaomi_mimo)
+#   * <provider>.sh — per-adapter files (anthropic, openai, deepseek, minimax, zai, kimicode, claudecode, opencode, xiaomi_mimo)
 #
 # HTTP collection uses _aiquotas_http_get, a single seam that can be intercepted
 # by an HTTP shim in tests/helpers/shims/curl (Todo 2) without modifying this file.
@@ -50,6 +50,7 @@ declare -gA AIQUOTAS_LABELS=(
     [zai]="zai"
     [kimicode]="Kimi"
     [claudecode]="Claude Code"
+    [opencode]="OpenCode Go"
 )
 
 # Default URLs per provider endpoint. URL can be overridden via plugin options.
@@ -66,6 +67,7 @@ declare -gA AIQUOTAS_DEFAULT_URLS=(
     [zai_quota]="https://api.z.ai/api/monitor/usage/quota/limit"
     [kimicode_usage]="https://api.kimi.com/coding/v1/usages"
     [claudecode_usage]="https://api.anthropic.com/api/oauth/usage"
+    [opencode_usage]="https://opencode.ai/zen/go/v1/usage"
 )
 
 # =============================================================================
@@ -137,6 +139,7 @@ _aiquotas_load_all_providers() {
     _aiquotas_load_provider zai
     _aiquotas_load_provider kimicode
     _aiquotas_load_provider claudecode
+    _aiquotas_load_provider opencode
 }
 
 # =============================================================================
@@ -219,6 +222,12 @@ plugin_declare_options() {
     declare_option "claudecode_usage_url" "string" "${AIQUOTAS_DEFAULT_URLS[claudecode_usage]}" "Claude subscription usage endpoint"
     declare_option "claudecode_credentials_file" "path" "${HOME}/.claude/.credentials.json" "Claude Code OAuth credentials file (used when CLAUDE_CODE_OAUTH_TOKEN is unset)"
 
+    # OpenCode Go subscription. The endpoint is undocumented upstream; see the
+    # header of src/plugins/aiquotas/opencode.sh for what was verified and how
+    # it degrades if the shape changes.
+    declare_option "opencode_usage_url" "string" "${AIQUOTAS_DEFAULT_URLS[opencode_usage]}" "OpenCode Go usage endpoint"
+    declare_option "opencode_auth_file" "path" "${XDG_DATA_HOME:-${HOME}/.local/share}/opencode/auth.json" "OpenCode auth store (used when OPENCODE_API_KEY is unset)"
+
     declare_option "icon" "icon" $'\uEE9C' "Plugin icon (brain)"
     declare_option "cache_ttl" "number" "300" "Cache duration in seconds"
 }
@@ -241,9 +250,9 @@ plugin_get_presence() { printf 'conditional'; }
 _aiquotas_collect_provider() {
     # Dispatches one provider's collection through its dedicated adapter
     # (anthropic / openai / deepseek / minimax / zai / kimicode / claudecode /
-    # xiaomi_mimo). Each adapter returns the canonical metrics document on
-    # stdout (or an empty string on hard transport failure). Does NOT touch
-    # plugin_data.
+    # opencode / xiaomi_mimo). Each adapter returns the canonical metrics
+    # document on stdout (or an empty string on hard transport failure). Does
+    # NOT touch plugin_data.
     local provider="$1"
     local timeout
     timeout=$(get_option "timeout")
@@ -261,6 +270,7 @@ _aiquotas_collect_provider() {
     zai) _aiquotas_collect_zai 2>/dev/null ;;
     kimicode) _aiquotas_collect_kimicode 2>/dev/null ;;
     claudecode) _aiquotas_collect_claudecode 2>/dev/null ;;
+    opencode) _aiquotas_collect_opencode 2>/dev/null ;;
     *) return 64 ;;
     esac
 }
@@ -288,7 +298,7 @@ plugin_collect() {
         [[ -n "$provider" ]] || continue
 
         case "$provider" in
-        anthropic | openai | deepseek | minimax | zai | kimicode | claudecode)
+        anthropic | openai | deepseek | minimax | zai | kimicode | claudecode | opencode)
             # Unified dispatch: every adapter owns its own HTTP+normalization
             # and returns a canonical metrics document on stdout (or empty
             # on hard transport failure). See _aiquotas_collect_provider.

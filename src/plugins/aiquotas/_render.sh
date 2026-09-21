@@ -96,6 +96,7 @@ _aiquotas_render_label() {
         zai) printf 'zai' ;;
         kimicode) printf 'KM' ;;
         claudecode) printf 'CC' ;;
+        opencode) printf 'OC' ;;
         *) printf '%s' "$provider" ;;
         esac
         return

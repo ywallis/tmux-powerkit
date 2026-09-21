@@ -1,0 +1,22 @@
+# OpenCode Go subscription usage fixtures manifest.
+#
+# Format per line (tab-separated):
+#   STATUS <TAB> BODY_FILE <TAB> EXPECTED_URL_REGEX
+#
+# Lines starting with "#" are ignored. The shim consumes the Nth
+# non-comment line on the Nth invocation; on URL mismatch it FAIL HARD
+# (exit 70) to prevent accidental network access.
+#
+# Dedicated manifest so existing fixtures stay stable.
+
+# 1. happy path — rolling 20% used, weekly 45% used, monthly 30% used
+200	tests/fixtures/aiquotas/opencode-usage.json	^https://opencode\.ai/zen/go/v1/usage$
+
+# 2. revoked or mistyped key
+401	tests/fixtures/aiquotas/401.json	^https://opencode\.ai/zen/go/v1/usage$
+
+# 3. rate limited
+429	tests/fixtures/aiquotas/429.json	^https://opencode\.ai/zen/go/v1/usage$
+
+# 4. unrecognised window shape
+200	tests/fixtures/aiquotas/opencode-malformed.json	^https://opencode\.ai/zen/go/v1/usage$

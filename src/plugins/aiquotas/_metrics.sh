@@ -434,6 +434,73 @@ _aiquotas_metrics_document() {
                 )
             end;
 
+        def emit_opencode:
+            # OpenCode Go plan usage:
+            #   {usage:{rolling:{status,percent,resetsAt},
+            #           weekly:{...}, monthly:{...}}}
+            #
+            # percent is % CONSUMED and there are no dollar figures or limits in
+            # the response, so this is a pure 0-100 scale. Modelled as ONE quota
+            # record like zai, kimicode and claudecode: the rolling window is the
+            # record and the weekly window rides along in weekly_remaining_percent,
+            # which is what the dual-window compact renderer and the weekly health
+            # escalation in _health.sh both read.
+            #
+            # monthly is deliberately ignored: the canonical record holds exactly
+            # one interval and one weekly percentage and the plan meters three
+            # windows, so it has nowhere to go. See the adapter header.
+            #
+            # The per-window `status` string is not interpreted. Only "ok" has been
+            # observed, so mapping the others would be guesswork; health comes from
+            # percent through the shared threshold evaluator instead.
+            (.usage // null) as $u |
+            if ($u | type) != "object"
+            then error("unknown schema")
+            else
+                ($u.rolling.percent?  // null) as $pct5 |
+                ($u.weekly.percent?   // null) as $pctwk |
+                ($u.rolling.resetsAt? // null) as $reset5 |
+                ($u.weekly.resetsAt?  // null) as $resetwk |
+                if (($pct5 | type) != "number") and (($pctwk | type) != "number")
+                then error("unknown schema")
+                else
+                    (($pct5 | type) == "number") as $has5 |
+                    # Prefer the rolling window, fall back to weekly, mirroring
+                    # emit_zai and emit_claudecode. Labelled "5h" rather than
+                    # "rolling" to match the sibling adapters: the plan documents
+                    # it as a five-hour window.
+                    (if $has5 then "5h"    else "weekly" end) as $label |
+                    (if $has5 then $pct5   else $pctwk    end) as $raw |
+                    (if $has5 then $reset5 else $resetwk  end) as $reset |
+                    # Window length, so window_start can be derived from the reset.
+                    (if $has5 then 18000   else 604800    end) as $span |
+                    ($raw | clamp_pct) as $pct |
+                    reset_epoch($reset) as $epoch |
+                    (if $epoch != null then ($epoch | todate) else null end) as $we_iso |
+                    (if $epoch != null then (($epoch - $span) | todate) else null end) as $ws_iso |
+                    record(
+                        "quota";
+                        $pct;
+                        100;
+                        (100 - $pct);
+                        "percent";
+                        null;
+                        $ws_iso;
+                        $we_iso;
+                        $we_iso;
+                        "official";
+                        ({resource: "subscription", line_item: $label} +
+                         {interval_remaining_percent: (100 - $pct)} +
+                         # Only when rolling is the primary. With weekly already
+                         # the record, a weekly dimension would duplicate it and
+                         # the renderer would print the same number twice.
+                         (if $has5 and (($pctwk | type) == "number")
+                          then {weekly_remaining_percent: (100 - ($pctwk | clamp_pct))}
+                          else {} end))
+                    )
+                end
+            end;
+
         # ---- top-level dispatch -------------------------------------------
         . as $root |
         if (type != "object") or has("error")
@@ -480,6 +547,13 @@ _aiquotas_metrics_document() {
         elif ($provider == "claudecode") and ($schema == "")
         then
             (try emit_claudecode catch null) as $rec |
+            if $rec == null
+            then doc([]; "official"; "unsupported"; "unknown schema")
+            else doc([ $rec ]; "official"; "ok"; null)
+            end
+        elif ($provider == "opencode") and ($schema == "")
+        then
+            (try emit_opencode catch null) as $rec |
             if $rec == null
             then doc([]; "official"; "unsupported"; "unknown schema")
             else doc([ $rec ]; "official"; "ok"; null)

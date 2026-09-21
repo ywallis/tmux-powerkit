@@ -3760,3 +3760,491 @@ _setup_aiq_shim_claudecode() {
     assert_success
     [[ "$output" == "error" ]]
 }
+
+# ---------- OpenCode Go subscription ----------------------------------------
+
+_setup_aiq_shim_opencode() {
+    export AIQUOTAS_HTTP_SCENARIO="$POWERKIT_ROOT/tests/fixtures/aiquotas/http/opencode-providers.tsv"
+    export AIQUOTAS_HTTP_STATE
+    AIQUOTAS_HTTP_STATE="$(mktemp -d -t aiquotas_http_oc.XXXXXX)"
+    : >"$AIQUOTAS_HTTP_STATE/counter"
+    export PATH="$POWERKIT_ROOT/tests/helpers/shims:$PATH"
+}
+
+@test "opencode metrics: usage -> rolling quota record with weekly dimension" {
+    run _aiquotas_metrics_document "opencode" \
+        '{"usage":{
+           "rolling":{"status":"ok","percent":20,"resetsAt":"2026-09-21T11:13:45.974Z"},
+           "weekly":{"status":"ok","percent":45,"resetsAt":"2026-09-28T00:00:00.000Z"},
+           "monthly":{"status":"ok","percent":30,"resetsAt":"2026-10-16T12:37:27.000Z"}}}'
+    assert_success
+    run jq -e '
+        (.records | length == 1) and
+        (.records[0].metric_kind == "quota") and
+        (.records[0].unit == "percent") and
+        (.records[0].value == 20) and
+        (.records[0].limit == 100) and
+        (.records[0].remaining == 80) and
+        (.records[0].dimensions.resource == "subscription") and
+        (.records[0].dimensions.line_item == "5h") and
+        (.records[0].dimensions.interval_remaining_percent == 80) and
+        (.records[0].dimensions.weekly_remaining_percent == 55) and
+        (.records[0].dimensions.model == null) and
+        (.records[0].window_start == "2026-09-21T06:13:45Z") and
+        (.records[0].window_end == "2026-09-21T11:13:45Z") and
+        (.records[0].reset_at == "2026-09-21T11:13:45Z")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode metrics: monthly window is dropped, never leaked into dimensions" {
+    # The canonical record holds one interval + one weekly percentage, so the
+    # third window must be absent rather than silently occupying the weekly
+    # slot, which would misreport the weekly budget.
+    run _aiquotas_metrics_document "opencode" \
+        '{"usage":{
+           "rolling":{"percent":20,"resetsAt":"2026-09-21T11:13:45.974Z"},
+           "weekly":{"percent":45,"resetsAt":"2026-09-28T00:00:00.000Z"},
+           "monthly":{"percent":99,"resetsAt":"2026-10-16T12:37:27.000Z"}}}'
+    assert_success
+    run jq -e '
+        (.records[0].dimensions.weekly_remaining_percent == 55) and
+        ([.records[0].dimensions | to_entries[] | select(.key | test("monthly"))] | length == 0)
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode metrics: weekly-only payload uses weekly as primary, no weekly dimension" {
+    # Falling back to weekly makes it the record itself; carrying it a second
+    # time as a dimension would make the renderer print the same number twice.
+    run _aiquotas_metrics_document "opencode" \
+        '{"usage":{"weekly":{"percent":45,"resetsAt":"2026-09-28T00:00:00.000Z"}}}'
+    assert_success
+    run jq -e '
+        (.records | length == 1) and
+        (.records[0].value == 45) and
+        (.records[0].remaining == 55) and
+        (.records[0].dimensions.line_item == "weekly") and
+        (.records[0].dimensions.interval_remaining_percent == 55) and
+        (.records[0].dimensions.weekly_remaining_percent == null) and
+        (.records[0].window_start == "2026-09-21T00:00:00Z") and
+        (.records[0].window_end == "2026-09-28T00:00:00Z")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode metrics: per-window status string is not interpreted" {
+    # Only "ok" has been observed upstream, so health must come from percent
+    # through the shared threshold evaluator rather than from this field.
+    run _aiquotas_metrics_document "opencode" \
+        '{"usage":{"rolling":{"status":"exceeded","percent":3,"resetsAt":"2026-09-21T11:13:45.974Z"}}}'
+    assert_success
+    run jq -e '
+        (.records | length == 1) and
+        (.records[0].value == 3) and
+        (.records[0].remaining == 97) and
+        (.records[0].status == "ok") and
+        (.provider_outcomes[0].status == "ok")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode metrics: clamps percent >100 and <0 into [0,100]" {
+    run _aiquotas_metrics_document "opencode" \
+        '{"usage":{"rolling":{"percent":140,"resetsAt":"2026-09-21T11:13:45.974Z"},
+                   "weekly":{"percent":-20,"resetsAt":"2026-09-28T00:00:00.000Z"}}}'
+    assert_success
+    run jq -e '
+        (.records[0].value == 100) and
+        (.records[0].remaining == 0) and
+        (.records[0].dimensions.weekly_remaining_percent == 100)
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode metrics: unparseable reset timestamp yields null windows, not a wrong one" {
+    run _aiquotas_metrics_document "opencode" \
+        '{"usage":{"rolling":{"percent":20,"resetsAt":"not-a-timestamp"}}}'
+    assert_success
+    run jq -e '
+        (.records | length == 1) and
+        (.records[0].value == 20) and
+        (.records[0].window_start == null) and
+        (.records[0].window_end == null) and
+        (.records[0].reset_at == null)
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode metrics: missing usage envelope -> unsupported, no records" {
+    run _aiquotas_metrics_document "opencode" '{"subscribedAt":"2026-05-22T14:30:00.000Z"}'
+    assert_success
+    run jq -e '
+        (.records | length == 0) and
+        (.provider_outcomes[0].provider == "opencode") and
+        (.provider_outcomes[0].status == "unsupported")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode metrics: only unknown window names -> unsupported, no records" {
+    run _aiquotas_metrics_document "opencode" \
+        '{"usage":{"tangerine":{"status":"ok","percent":5}}}'
+    assert_success
+    run jq -e '
+        (.records | length == 0) and
+        (.provider_outcomes[0].status == "unsupported")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode metrics: dollar-denominated shape from the upstream issues -> unsupported" {
+    # anomalyco/opencode#16017 and #31084 propose usageDollars/limitDollars/
+    # resetInSec. That is the issue authors' invention, not what the service
+    # returns; if it ever ships, this must degrade rather than emit zeroes.
+    run _aiquotas_metrics_document "opencode" \
+        '{"rolling5h":{"usageDollars":2.34,"limitDollars":12,"usagePercent":19.5,"resetInSec":7200},
+          "weekly":{"usageDollars":8.91,"limitDollars":30,"usagePercent":29.7,"resetInSec":345600}}'
+    assert_success
+    run jq -e '
+        (.records | length == 0) and
+        (.provider_outcomes[0].status == "unsupported")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "_aiquotas_collect_opencode is defined as a callable function" {
+    run bash -c '
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider opencode
+        declare -F _aiquotas_collect_opencode >/dev/null && echo DEFINED || echo MISSING
+    ' _ "$POWERKIT_ROOT"
+    assert_success
+    assert_output "DEFINED"
+}
+
+@test "opencode adapter: no key and no auth file -> unconfigured WITHOUT calling curl" {
+    run bash -c '
+        unset OPENCODE_API_KEY
+        export PATH="$1/tests/helpers/shims:$PATH"
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider opencode
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        get_option() {
+            case "$1" in
+                opencode_auth_file) printf "/nonexistent/auth.json" ;;
+                opencode_usage_url) printf "https://opencode.ai/zen/go/v1/usage" ;;
+                timeout) printf "5" ;;
+                *) printf "" ;;
+            esac
+        }
+        _aiquotas_collect_opencode
+    ' _ "$POWERKIT_ROOT"
+    assert_success
+    run jq -e '
+        (.schema_version == 1) and
+        (.records | length == 0) and
+        (.provider_outcomes[0].provider == "opencode") and
+        (.provider_outcomes[0].source == "official") and
+        (.provider_outcomes[0].status == "unconfigured")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode adapter: an auth file without an opencode-go entry -> unconfigured" {
+    # A user on Zen pay-as-you-go has an auth.json but no Go subscription.
+    run bash -c '
+        unset OPENCODE_API_KEY
+        export PATH="$1/tests/helpers/shims:$PATH"
+        AUTH="$(mktemp -t aqoc_auth.XXXXXX)"
+        printf "%s" "{\"anthropic\":{\"type\":\"oauth\"}}" >"$AUTH"
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider opencode
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        get_option() {
+            case "$1" in
+                opencode_auth_file) printf "%s" "$AUTH" ;;
+                opencode_usage_url) printf "https://opencode.ai/zen/go/v1/usage" ;;
+                timeout) printf "5" ;;
+                *) printf "" ;;
+            esac
+        }
+        _aiquotas_collect_opencode
+        rm -f "$AUTH"
+    ' _ "$POWERKIT_ROOT"
+    assert_success
+    run jq -e '
+        (.records | length == 0) and
+        (.provider_outcomes[0].status == "unconfigured")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode adapter: auth path with a literal ~/ prefix is expanded against HOME" {
+    run bash -c '
+        unset OPENCODE_API_KEY
+        HOME="$(mktemp -d -t aqoc_home.XXXXXX)"
+        export HOME
+        mkdir -p "$HOME/.local/share/opencode"
+        printf "%s" "{\"opencode-go\":{\"type\":\"api\",\"key\":\"sk-tilde-fixture\"}}" \
+            >"$HOME/.local/share/opencode/auth.json"
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider opencode
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        get_option() {
+            case "$1" in
+                opencode_auth_file) printf "~/.local/share/opencode/auth.json" ;;
+                *) printf "" ;;
+            esac
+        }
+        _aiquotas_opencode_key
+    ' _ "$POWERKIT_ROOT"
+    assert_success
+    assert_output "sk-tilde-fixture"
+}
+
+@test "opencode adapter: OPENCODE_API_KEY is preferred over the auth file" {
+    _setup_aiq_shim_opencode
+    run bash -c '
+        export AIQUOTAS_HTTP_SCENARIO="$1/tests/fixtures/aiquotas/http/opencode-providers.tsv"
+        export AIQUOTAS_HTTP_STATE
+        AIQUOTAS_HTTP_STATE="$(mktemp -d -t aqtoc.XXXXXX)"
+        : >"$AIQUOTAS_HTTP_STATE/counter"
+        export OPENCODE_API_KEY="sk-env-fixture-only-0000"
+        export PATH="$1/tests/helpers/shims:$PATH"
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider opencode
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        get_option() {
+            case "$1" in
+                opencode_auth_file) printf "/nonexistent/auth.json" ;;
+                opencode_usage_url) printf "https://opencode.ai/zen/go/v1/usage" ;;
+                timeout) printf "5" ;;
+                *) printf "" ;;
+            esac
+        }
+        _aiquotas_collect_opencode
+    ' _ "$POWERKIT_ROOT"
+    _teardown_aiq_shim
+    assert_success
+    run jq -e '
+        (.records | length == 1) and
+        (.records[0].value == 20) and
+        (.provider_outcomes[0].status == "ok")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode adapter: key is read from the auth file when env is unset" {
+    _setup_aiq_shim_opencode
+    run bash -c '
+        unset OPENCODE_API_KEY
+        export AIQUOTAS_HTTP_SCENARIO="$1/tests/fixtures/aiquotas/http/opencode-providers.tsv"
+        export AIQUOTAS_HTTP_STATE
+        AIQUOTAS_HTTP_STATE="$(mktemp -d -t aqtoc.XXXXXX)"
+        : >"$AIQUOTAS_HTTP_STATE/counter"
+        AUTH="$(mktemp -t aqoc_auth.XXXXXX)"
+        printf "%s" "{\"opencode-go\":{\"type\":\"api\",\"key\":\"sk-file-fixture-only-0000\"}}" >"$AUTH"
+        export PATH="$1/tests/helpers/shims:$PATH"
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider opencode
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        get_option() {
+            case "$1" in
+                opencode_auth_file) printf "%s" "$AUTH" ;;
+                opencode_usage_url) printf "https://opencode.ai/zen/go/v1/usage" ;;
+                timeout) printf "5" ;;
+                *) printf "" ;;
+            esac
+        }
+        _aiquotas_collect_opencode
+        rm -f "$AUTH"
+    ' _ "$POWERKIT_ROOT"
+    _teardown_aiq_shim
+    assert_success
+    run jq -e '
+        (.records | length == 1) and
+        (.records[0].value == 20) and
+        (.records[0].dimensions.weekly_remaining_percent == 55) and
+        (.provider_outcomes[0].status == "ok")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode adapter: 401 (revoked key) -> status=unauthorized, no records" {
+    _setup_aiq_shim_opencode
+    # Manifest line 2 is the 401 (pre-seed counter to 1).
+    run bash -c '
+        export AIQUOTAS_HTTP_SCENARIO="$1/tests/fixtures/aiquotas/http/opencode-providers.tsv"
+        export AIQUOTAS_HTTP_STATE
+        AIQUOTAS_HTTP_STATE="$(mktemp -d -t aqtoc.XXXXXX)"
+        printf "%d\n" 1 >"$AIQUOTAS_HTTP_STATE/counter"
+        export OPENCODE_API_KEY="sk-dummy-fixture-only-0000"
+        export PATH="$1/tests/helpers/shims:$PATH"
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider opencode
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        _aiquotas_collect_opencode
+    ' _ "$POWERKIT_ROOT"
+    _teardown_aiq_shim
+    assert_success
+    run jq -e '
+        (.records | length == 0) and
+        (.provider_outcomes[0].status == "unauthorized")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode adapter: 429 -> status=rate_limited" {
+    _setup_aiq_shim_opencode
+    # Manifest line 3 is the 429 (pre-seed counter to 2).
+    run bash -c '
+        export AIQUOTAS_HTTP_SCENARIO="$1/tests/fixtures/aiquotas/http/opencode-providers.tsv"
+        export AIQUOTAS_HTTP_STATE
+        AIQUOTAS_HTTP_STATE="$(mktemp -d -t aqtoc.XXXXXX)"
+        printf "%d\n" 2 >"$AIQUOTAS_HTTP_STATE/counter"
+        export OPENCODE_API_KEY="sk-dummy-fixture-only-0000"
+        export PATH="$1/tests/helpers/shims:$PATH"
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider opencode
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        _aiquotas_collect_opencode
+    ' _ "$POWERKIT_ROOT"
+    _teardown_aiq_shim
+    assert_success
+    run jq -e '
+        (.records | length == 0) and
+        (.provider_outcomes[0].status == "rate_limited")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode adapter: unrecognised window shape -> unsupported, no records" {
+    _setup_aiq_shim_opencode
+    # Manifest line 4 is the malformed body (pre-seed counter to 3).
+    run bash -c '
+        export AIQUOTAS_HTTP_SCENARIO="$1/tests/fixtures/aiquotas/http/opencode-providers.tsv"
+        export AIQUOTAS_HTTP_STATE
+        AIQUOTAS_HTTP_STATE="$(mktemp -d -t aqtoc.XXXXXX)"
+        printf "%d\n" 3 >"$AIQUOTAS_HTTP_STATE/counter"
+        export OPENCODE_API_KEY="sk-dummy-fixture-only-0000"
+        export PATH="$1/tests/helpers/shims:$PATH"
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _aiquotas_load_provider opencode
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        _aiquotas_collect_opencode
+    ' _ "$POWERKIT_ROOT"
+    _teardown_aiq_shim
+    assert_success
+    run jq -e '
+        (.records | length == 0) and
+        (.provider_outcomes[0].status == "unsupported")
+    ' <<<"$output"
+    assert_success
+}
+
+@test "opencode compact render: dual-window shows interval/weekly % left" {
+    run bash -c '
+        unset TMUX
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        PAYLOAD=$(cat "$1/tests/fixtures/aiquotas/opencode-usage.json")
+        DOC=$(_aiquotas_metrics_document "opencode" "$PAYLOAD")
+        plugin_data_set "providers_count" "1"
+        plugin_data_set "providers_failed" "0"
+        plugin_data_set "document_opencode" "$DOC"
+        plugin_data_set "outcome_opencode" "{\"provider\":\"opencode\",\"source\":\"official\",\"status\":\"ok\",\"error\":null}"
+        get_option() {
+            case "$1" in
+                providers) printf "opencode" ;;
+                *) printf "" ;;
+            esac
+        }
+        plugin_render
+    ' _ "$POWERKIT_ROOT"
+    assert_success
+    assert_output "OpenCode Go 80/55% left"
+}
+
+@test "opencode compact_content: short label and no trailing ' left'" {
+    run bash -c '
+        unset TMUX
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        PAYLOAD=$(cat "$1/tests/fixtures/aiquotas/opencode-usage.json")
+        DOC=$(_aiquotas_metrics_document "opencode" "$PAYLOAD")
+        plugin_data_set "providers_count" "1"
+        plugin_data_set "providers_failed" "0"
+        plugin_data_set "document_opencode" "$DOC"
+        plugin_data_set "outcome_opencode" "{\"provider\":\"opencode\",\"source\":\"official\",\"status\":\"ok\",\"error\":null}"
+        get_option() {
+            case "$1" in
+                providers) printf "opencode" ;;
+                compact_content) printf "true" ;;
+                *) printf "" ;;
+            esac
+        }
+        plugin_render
+    ' _ "$POWERKIT_ROOT"
+    assert_success
+    assert_output "OC 80/55%"
+}
+
+@test "opencode: healthy rolling but near-exhausted weekly escalates health to error" {
+    run bash -c '
+        unset TMUX
+        source "$1/src/core/bootstrap.sh"
+        source "$1/src/contract/plugin_contract.sh"
+        source "$1/src/plugins/aiquotas.sh"
+        _set_plugin_context aiquotas
+        plugin_declare_options
+        PAYLOAD=$(cat "$1/tests/fixtures/aiquotas/opencode-weekly-exhausted.json")
+        DOC=$(_aiquotas_metrics_document "opencode" "$PAYLOAD")
+        plugin_data_set "providers_count" "1"
+        plugin_data_set "providers_failed" "0"
+        plugin_data_set "document_opencode" "$DOC"
+        plugin_data_set "outcome_opencode" "{\"provider\":\"opencode\",\"source\":\"official\",\"status\":\"ok\",\"error\":null}"
+        get_option() {
+            case "$1" in
+                providers) printf "opencode" ;;
+                warning_threshold) printf "80" ;;
+                critical_threshold) printf "95" ;;
+                *) printf "" ;;
+            esac
+        }
+        plugin_get_health
+    ' _ "$POWERKIT_ROOT"
+    assert_success
+    [[ "$output" == "error" ]]
+}
